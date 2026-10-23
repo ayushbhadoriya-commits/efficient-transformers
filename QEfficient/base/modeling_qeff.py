@@ -1339,6 +1339,7 @@ class QEFFBaseModel(ABC):
             )
             mdp_compiler_dump_path = None
 
+        onnx_prepare_start = time.perf_counter()
         if onnx_path is None:
             # If weights were offloaded after export, compiling must use the existing
             # ONNX because re-exporting is no longer possible. Otherwise export for
@@ -1362,6 +1363,14 @@ class QEFFBaseModel(ABC):
                     kv_cache_prefix=kv_cache_prefix,
                     **compiler_options,
                 )
+
+        onnx_prepare_seconds = time.perf_counter() - onnx_prepare_start
+        logger.info(
+            "Timing | ONNX export or cache lookup: %.2f seconds | onnx=%s",
+            onnx_prepare_seconds,
+            onnx_path,
+        )
+
         if QEFFBaseModel._layerwise_active:
             if onnx_path is None:
                 return None
@@ -1645,6 +1654,7 @@ class QEFFBaseModel(ABC):
             logger.info(f"Compiler artifacts written to {compile_dir}")
             return compile_dir
 
+        final_compile_start = time.perf_counter()
         try:
             subprocess.run(command, capture_output=True, check=True, env=compiler_env)
         except subprocess.CalledProcessError as e:
@@ -1659,6 +1669,13 @@ class QEFFBaseModel(ABC):
                         e.stderr.decode(),
                     ]
                 )
+            )
+        finally:
+            final_compile_seconds = time.perf_counter() - final_compile_start
+            logger.info(
+                "Timing | final qaic-compile: %.2f seconds | qpc=%s",
+                final_compile_seconds,
+                qpc_path,
             )
         # Dump JSON file with hashed parameters
         hashed_compile_params_path = compile_dir / "hashed_compile_params.json"
