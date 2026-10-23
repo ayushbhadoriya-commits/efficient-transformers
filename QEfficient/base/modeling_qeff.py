@@ -1304,6 +1304,7 @@ class QEFFBaseModel(ABC):
             )
             mdp_compiler_dump_path = None
 
+        onnx_prepare_start = time.perf_counter()
         if onnx_path is None:
             # If weights were offloaded after export, compiling must use the existing
             # ONNX because re-exporting is no longer possible. Otherwise export for
@@ -1327,6 +1328,14 @@ class QEFFBaseModel(ABC):
                     kv_cache_prefix=kv_cache_prefix,
                     **compiler_options,
                 )
+
+        onnx_prepare_seconds = time.perf_counter() - onnx_prepare_start
+        logger.info(
+            "Timing | ONNX export or cache lookup: %.2f seconds | onnx=%s",
+            onnx_prepare_seconds,
+            onnx_path,
+        )
+
         if QEFFBaseModel._layerwise_active:
             if onnx_path is None:
                 return None
@@ -1414,13 +1423,11 @@ class QEFFBaseModel(ABC):
             logger.info("Using ONNX subfunctions for compilation.")
             command.append("-sub-functions")
 
-        model_in_bfloat16 = hasattr(self, "config") and (self.config.torch_dtype == torch.bfloat16)
-        io_name_prefix = ("past_", "pixel_values", "conv_", "recurrent_", "compressed_kv")
-        pkv_in_bfloat16 = (custom_io is not None) and any(
-            any(bfloat16_io_name in key for bfloat16_io_name in io_name_prefix) and "bfloat16" in value
-            for key, value in custom_io.items()
+        custom_io_for_compiler = (
+            {key: value for key, value in custom_io.items() if "bfloat16" not in value} or None
+            if custom_io is not None
+            else None
         )
-        custom_io_for_compiler = custom_io if not (model_in_bfloat16 and pkv_in_bfloat16) else None
 
         # MDP partition config selection (highest priority first):
         #   1. User-provided pre-built MDP JSON (mdp_load_partition_config).
@@ -1480,7 +1487,7 @@ class QEFFBaseModel(ABC):
         compile_hash_params = {
             "command": command,
             "specializations": specializations,
-            "custom_io": custom_io,
+            "custom_io": custom_io_for_compiler,
             "mdp_ts_num_devices": mdp_ts_num_devices,
             "mdp_num_partitions": mdp_num_partitions,
             "mdp_strategy": mdp_strategy.value,
@@ -1549,17 +1556,12 @@ class QEFFBaseModel(ABC):
             command.append(f"-network-specialization-config={specializations_json}")
 
         # Write custom_io.yaml file
-        if custom_io is not None:
+        if custom_io_for_compiler is not None:
             custom_io_yaml = compile_dir / "custom_io.yaml"
             with open(custom_io_yaml, "w") as fp:
-                for io_name, dtype in custom_io.items():
+                for io_name, dtype in custom_io_for_compiler.items():
                     fp.write(f" - IOName: {io_name}\n   Precision: {dtype}\n\n")
-            if model_in_bfloat16 and pkv_in_bfloat16:
-                logger.warning(
-                    "Model and Past KV types are both bfloat16. Custom IO list file will be ignored during compile."
-                )
-            else:
-                command.append(f"-custom-IO-list-file={custom_io_yaml}")
+            command.append(f"-custom-IO-list-file={custom_io_yaml}")
 
         command.append(f"-aic-binary-dir={qpc_path}")
         if artifacts:
@@ -1617,6 +1619,7 @@ class QEFFBaseModel(ABC):
             logger.info(f"Compiler artifacts written to {compile_dir}")
             return compile_dir
 
+        final_compile_start = time.perf_counter()
         try:
             subprocess.run(command, capture_output=True, check=True, env=compiler_env)
         except subprocess.CalledProcessError as e:
@@ -1631,6 +1634,13 @@ class QEFFBaseModel(ABC):
                         e.stderr.decode(),
                     ]
                 )
+            )
+        finally:
+            final_compile_seconds = time.perf_counter() - final_compile_start
+            logger.info(
+                "Timing | final qaic-compile: %.2f seconds | qpc=%s",
+                final_compile_seconds,
+                qpc_path,
             )
         # Dump JSON file with hashed parameters
         hashed_compile_params_path = compile_dir / "hashed_compile_params.json"

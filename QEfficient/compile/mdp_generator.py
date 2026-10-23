@@ -561,6 +561,114 @@ def generate_disagg_mdp_partition_config(
     }
 
 
+def _repair_scoped_alias_partitioning(onnx_path: str, mdp_json: Dict[str, Any], compiler_dump: Dict[str, Any]) -> int:
+    """Align scoped aliases with the compiler dump partition."""
+    model = onnx.load(onnx_path, load_external_data=False)
+    names = {n.name for n in model.graph.node if n.name}
+    inlined_node_map, _ = _get_inlined_node_map(model)
+    for expanded_names in inlined_node_map.values():
+        names.update(expanded_names)
+    compiler_partition, compiler_position, compiler_nodes = {}, {}, set()
+    for partition_idx, partition in enumerate(compiler_dump.get("partitions", [])):
+        for node_pos, node_name in enumerate(partition.get("nodeList", [])):
+            if node_name:
+                compiler_nodes.add(node_name)
+                compiler_partition.setdefault(node_name, partition_idx)
+                compiler_position.setdefault(node_name, (partition_idx, node_pos))
+    current_partition = {}
+    for partition_idx, partition in enumerate(mdp_json.get("partitions", [])):
+        for node_name in partition.get("nodeList", []):
+            if node_name:
+                current_partition[node_name] = partition_idx
+    node_by_name = {node.name: node for node in model.graph.node if node.name}
+    consumers_by_value = {}
+    producer_by_value = {}
+    for node in model.graph.node:
+        if not node.name:
+            continue
+        for input_name in node.input:
+            if input_name:
+                consumers_by_value.setdefault(input_name, []).append(node.name)
+        for output_name in node.output:
+            if output_name:
+                producer_by_value[output_name] = node.name
+
+    def _upstream_partition_indices(node_name: str, visited: Optional[Set[str]] = None) -> Set[int]:
+        """Find explicit MDP partitions of a node's direct or folded producers."""
+        if visited is None:
+            visited = set()
+        if node_name in visited:
+            return set()
+        visited.add(node_name)
+
+        node = node_by_name.get(node_name)
+        if node is None:
+            return set()
+
+        partitions: Set[int] = set()
+        for input_name in node.input:
+            producer_name = producer_by_value.get(input_name)
+            if producer_name is None:
+                continue
+            producer_partition = current_partition.get(producer_name)
+            if producer_partition is not None:
+                partitions.add(producer_partition)
+            else:
+                partitions.update(_upstream_partition_indices(producer_name, visited))
+        return partitions
+
+    repairs = []
+    for node_name, source_idx in current_partition.items():
+        if not node_name.startswith("/") or node_name.startswith("/language_model/"):
+            continue
+        peer_name = "/language_model" + node_name
+        target_idx = compiler_partition.get(node_name)
+        if peer_name not in names or peer_name in compiler_nodes or target_idx is None or target_idx == source_idx:
+            continue
+        node = node_by_name.get(node_name)
+        if node is not None:
+            producer_partitions = _upstream_partition_indices(node_name)
+            if any(producer_idx > target_idx for producer_idx in producer_partitions):
+                logger.warning(
+                    "Skipping MDP alias repair for %r: compiler target Partition%d would precede "
+                    "an existing producer partition",
+                    node_name,
+                    target_idx,
+                )
+                continue
+            consumer_partitions = {
+                current_partition[consumer_name]
+                for output_name in node.output
+                for consumer_name in consumers_by_value.get(output_name, [])
+                if consumer_name in current_partition
+            }
+            if any(consumer_idx < target_idx for consumer_idx in consumer_partitions):
+                logger.warning(
+                    "Skipping MDP alias repair for %r: compiler target Partition%d would follow "
+                    "an existing consumer partition",
+                    node_name,
+                    target_idx,
+                )
+                continue
+        repairs.append((node_name, source_idx, target_idx, compiler_position[node_name]))
+    for node_name, source_idx, target_idx, dump_pos in sorted(repairs, key=lambda item: item[3]):
+        mdp_json["partitions"][source_idx]["nodeList"].remove(node_name)
+        target_nodes = mdp_json["partitions"][target_idx]["nodeList"]
+        insert_at = len(target_nodes)
+        for idx, existing_name in enumerate(target_nodes):
+            if compiler_position.get(existing_name, (10**9, 10**9)) > dump_pos:
+                insert_at = idx
+                break
+        target_nodes.insert(insert_at, node_name)
+        logger.warning(
+            "MDP repaired compiler-scoped alias %r: moved from Partition%d to Partition%d",
+            node_name,
+            source_idx,
+            target_idx,
+        )
+    return len(repairs)
+
+
 def generate_disagg_mdp_intersection_config(
     onnx_path: str,
     compiler_dump_path: str,
@@ -576,7 +684,9 @@ def generate_disagg_mdp_intersection_config(
     QEff MDP, but the QEff MDP also contains nodes the compiler optimises away
     (constant-folded, etc.).  The intersection keeps only nodes that survive
     into the compiler IR, while preserving the **QEff MDP node order and
-    partition assignment** as the authoritative source of truth.
+    partition assignment** as the authoritative source of truth, except for
+    scoped aliases whose partition is aligned with the compiler dump when the
+    compiler materializes only the unscoped alias.
 
     Algorithm
     ---------
@@ -587,12 +697,16 @@ def generate_disagg_mdp_intersection_config(
        names the compiler will actually process.
     3. For each partition in the QEff MDP, retain only nodes whose names appear
        in the compiler dump set, in the original QEff order.
+    4. For scoped aliases with a compiler-only unscoped name, move the alias to
+       the compiler dump partition while preserving the compiler-relative order
+       needed by the compiler's partition validator.
 
     Why this is better than re-assigning compiler-dump nodes by heuristic:
     - Node order follows the ONNX topsort (compiler's SplitPlanMerge requires
       this); the compiler dump order is the compiler's internal IR order which
       may differ after constant-folding and other transforms.
-    - Partition boundaries are the same as the onnx strategy — no divergence.
+    - Partition boundaries are the same as the onnx strategy, except for the
+      narrow scoped-alias repair described above.
     - Every retained node is an exact-match hit in ``doManualPartitioning()``.
     - Output JSON is compact (~1-2 MB) because constant-folded nodes are pruned.
 
@@ -664,6 +778,17 @@ def generate_disagg_mdp_intersection_config(
             }
         )
 
+    mdp_json = {
+        "connections": qeff_mdp["connections"],
+        "partitions": partition_objs,
+    }
+
+    _repair_scoped_alias_partitioning(
+        onnx_path=onnx_path,
+        mdp_json=mdp_json,
+        compiler_dump=dump,
+    )
+
     logger.info(
         f"Intersection: {total_kept} nodes kept, {total_dropped} dropped "
         f"({total_dropped * 100 // max(qeff_total, 1)}% pruned by compiler)"
@@ -676,9 +801,76 @@ def generate_disagg_mdp_intersection_config(
             f"(compiler may have renamed them). Examples: {list(in_dump_not_qeff)[:5]}"
         )
 
+    return mdp_json
+
+
+_LAYER_NODE_PATTERN = re.compile(r"^(?P<prefix>.*/layers\.)(?P<layer>\d+)(?P<suffix>/.*)$")
+_REGEX_SPECIAL_CHARS = re.compile(r"([.^$*+?{}[\]\\|()])")
+
+
+def _escape_regex_literal(value: str) -> str:
+    """Escape regex metacharacters while keeping path separators readable."""
+    return _REGEX_SPECIAL_CHARS.sub(r"\\\1", value)
+
+
+def _compact_node_list_to_regex(node_list: List[str], min_group_size: int = 3) -> List[str]:
+    """Compact adjacent same-shape layer nodes into readable exact-match regexes.
+
+    The input ordering is preserved.  Only adjacent entries matching the same
+    ``<prefix>/layers.<number><suffix>`` shape are candidates, and a run needs
+    at least *min_group_size* nodes to be compacted.  This lets an isolated
+    layer node remain explicit while grouping a run such as layers 3--6.
+    """
+    compacted: List[str] = []
+    run: List[Tuple[str, re.Match]] = []
+    run_key: Optional[str] = None
+    # run_key: Optional[Tuple[str, str]] = None
+
+    def flush_run() -> None:
+        nonlocal run, run_key
+        if len(run) >= min_group_size:
+            assert run_key is not None
+            # prefix, suffix = run_key
+            prefix = run_key
+            layer_ids = "|".join(match.group("layer") for _, match in run)
+            compacted.append(
+                f"{_escape_regex_literal(prefix)}(?:{layer_ids})/.*"
+                # f"{_escape_regex_literal(prefix)}(?:{layer_ids}){_escape_regex_literal(suffix)}"
+            )
+        else:
+            compacted.extend(node_name for node_name, _ in run)
+        run = []
+        run_key = None
+
+    for node_name in node_list:
+        match = _LAYER_NODE_PATTERN.match(node_name)
+        if match is None:
+            flush_run()
+            compacted.append(node_name)
+            continue
+
+        # key = (match.group("prefix"), match.group("suffix"))
+        key = match.group("prefix")
+        if run_key is not None and key != run_key:
+            flush_run()
+        run.append((node_name, match))
+        run_key = key
+
+    flush_run()
+    return compacted
+
+
+def _compact_mdp_node_lists_to_regex(mdp_json: Dict[str, Any]) -> Dict[str, Any]:
+    """Return an inspection-only copy of an MDP config with compact node regexes."""
     return {
-        "connections": qeff_mdp["connections"],
-        "partitions": partition_objs,
+        **mdp_json,
+        "partitions": [
+            {
+                **partition,
+                "nodeList": _compact_node_list_to_regex(partition.get("nodeList", [])),
+            }
+            for partition in mdp_json.get("partitions", [])
+        ],
     }
 
 
@@ -754,4 +946,7 @@ def generate_disagg_mdp_config(
 
     mdp_ts_json_path = compile_dir / f"mdp_disagg_{mdp_ts_num_devices}d_{mdp_num_partitions}p.json"
     create_json(str(mdp_ts_json_path), mdp_ts_json)
+    regex_mdp_json = _compact_mdp_node_lists_to_regex(mdp_ts_json)
+    regex_mdp_json_path = compile_dir / f"mdp_disagg_{mdp_ts_num_devices}d_{mdp_num_partitions}p_regex.json"
+    create_json(str(regex_mdp_json_path), regex_mdp_json)
     return mdp_ts_json_path, mdp_ts_json
