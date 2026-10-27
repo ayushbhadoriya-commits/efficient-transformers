@@ -1,0 +1,2 @@
+normal_mdp_compile_seconds=490.03
+normal_mdp_compile_max_rss_kb=2017536

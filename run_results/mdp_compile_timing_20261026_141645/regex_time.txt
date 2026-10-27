@@ -1,0 +1,2 @@
+regex_mdp_compile_seconds=157.45
+regex_mdp_compile_max_rss_kb=1932908

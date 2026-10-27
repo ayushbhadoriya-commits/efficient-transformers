@@ -1,0 +1,9 @@
+===== regex MDP compile =====
+MDP: /home/ayush/.cache/qeff_models/Qwen3VLMoeForConditionalGeneration/Qwen3VLDecoderWrapper-02f5d27ed8142d56/mdp_8ab2e07e6b235077/mdp_disagg_7d_7p_regex.json
+Reading ONNX Model from /home/ayush/.cache/qeff_models/Qwen3VLMoeForConditionalGeneration/Qwen3VLDecoderWrapper-02f5d27ed8142d56/Qwen3VLDecoderWrapper.onnx
+Compile started ............... 
+Compiling model with FP16 precision.
+Warning message: Pipeline partitioner: Node "/Where" is producing a value that is consumed by node "/ReduceMax." These nodes reside in non-adjacent partitions. As a result, the value will be copied through intermediate partitions, which may have performance implications.
+Generated binary is present at /home/ayush/efficient-transformers/run_results/mdp_compile_timing_20261026_140108/regex_qpc
+regex_mdp_compile_seconds=148.58
+regex_mdp_compile_max_rss_kb=1691468

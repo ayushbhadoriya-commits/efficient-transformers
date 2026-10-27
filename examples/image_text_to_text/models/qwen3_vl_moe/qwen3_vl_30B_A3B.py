@@ -237,6 +237,7 @@ def run(
         continuous_batching=True,
         config=config,
         dtype=torch.float16,
+        weight_free=True,
         layerwise=False,
     )
     tokenizer = transformers.AutoTokenizer.from_pretrained(model_id)

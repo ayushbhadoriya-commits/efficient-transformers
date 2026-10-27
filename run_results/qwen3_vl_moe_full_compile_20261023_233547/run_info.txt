@@ -1,0 +1,4 @@
+Results directory: /home/ayush/efficient-transformers/run_results/qwen3_vl_moe_full_compile_20261023_233547
+prefill_devices=7 stages=7 decode_devices=16
+===== Model: Qwen/Qwen3-VL-30B-A3B-Instruct =====
+[Qwen3_VL_30B_A3B_Instruct_] Step 1/3: generating normal and regex MDP files

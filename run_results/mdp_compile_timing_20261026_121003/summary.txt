@@ -1,0 +1,5 @@
+Results directory: /home/ayush/efficient-transformers/run_results/mdp_compile_timing_20261026_121003
+normal_mdp_compile_seconds=490.03
+normal_mdp_compile_max_rss_kb=2017536
+regex_mdp_compile_seconds=185.93
+regex_mdp_compile_max_rss_kb=1907368
